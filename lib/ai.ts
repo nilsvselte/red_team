@@ -1,4 +1,5 @@
 import type { Post } from "./types";
+import crypto from "node:crypto";
 
 export type Cluster = {
   title: string;
@@ -98,39 +99,35 @@ async function callOpenAI(threads: Post[], apiKey: string): Promise<AIPerspectiv
     "Keep it concise, concrete, and avoid fluffy language.",
   ].join("\n");
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
-      messages: [
-        { role: "system", content: "You generate dashboards that summarize discussions." },
-        { role: "user", content: `${prompt}\n\nThreads:\n${JSON.stringify(sample, null, 2)}` },
-      ],
-      temperature: 0.4,
-    }),
+  const model = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
+  const cacheKey = hashKey({
+    kind: "overview",
+    model,
+    sample,
   });
 
-  if (!response.ok) {
-    throw new Error(`OpenAI responded with ${response.status}`);
-  }
+  const cached = getCache<AIPerspective>(cacheKey);
+  if (cached) return cached;
 
-  const json = await response.json();
-  const content = json.choices?.[0]?.message?.content as string | undefined;
-  if (!content) {
-    throw new Error("OpenAI response missing content");
-  }
+  const { content, modelUsed } = await openaiChatCompletion({
+    apiKey,
+    model,
+    temperature: 0.4,
+    messages: [
+      { role: "system", content: "You generate dashboards that summarize discussions." },
+      { role: "user", content: `${prompt}\n\nThreads:\n${JSON.stringify(sample, null, 2)}` },
+    ],
+  });
 
   const clusters = extractClusters(content);
-  return {
+  const result: AIPerspective = {
     summary: content.split("\n").slice(0, 3).join(" ").trim(),
     clusters,
-    modelUsed: json.model ?? "openai",
+    modelUsed,
     mode: "llm",
   };
+  setCache(cacheKey, result);
+  return result;
 }
 
 async function callOpenAIForGroupsLimited(
@@ -138,7 +135,12 @@ async function callOpenAIForGroupsLimited(
   apiKey: string
 ): Promise<GroupedAIPerspective> {
   const model = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
-  const maxGroups = Math.max(1, Number(process.env.AI_GROUP_MAX ?? 8));
+  const maxGroups = Number(process.env.AI_GROUP_MAX ?? 8);
+  if (!Number.isFinite(maxGroups) || maxGroups <= 0) {
+    return { homeworks: [], models: [], modelUsed: model, mode: "llm" };
+  }
+
+  const concurrency = Math.max(1, Number(process.env.AI_OPENAI_CONCURRENCY ?? 2));
 
   async function summarizeGroup(
     label: string,
@@ -164,29 +166,24 @@ async function callOpenAIForGroupsLimited(
       "- Use the thread's id and title exactly as provided.",
     ].join("\n");
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: "You produce precise, structured summaries." },
-          { role: "user", content: `${prompt}\n\nGroup: ${label}\n\nThreads:\n${JSON.stringify(sample, null, 2)}` },
-        ],
-        temperature: 0.25,
-      }),
+    const cacheKey = hashKey({
+      kind: "group",
+      model,
+      key,
+      sample,
     });
+    const cached = getCache<GroupSummary>(cacheKey);
+    if (cached) return cached;
 
-    if (!response.ok) {
-      throw new Error(`OpenAI responded with ${response.status}`);
-    }
-
-    const json = await response.json();
-    const content = json.choices?.[0]?.message?.content as string | undefined;
-    if (!content) throw new Error("OpenAI response missing content");
+    const { content } = await openaiChatCompletion({
+      apiKey,
+      model,
+      temperature: 0.25,
+      messages: [
+        { role: "system", content: "You produce precise, structured summaries." },
+        { role: "user", content: `${prompt}\n\nGroup: ${label}\n\nThreads:\n${JSON.stringify(sample, null, 2)}` },
+      ],
+    });
 
     const parsed = safeParseJsonObject(content) as
       | { overview?: unknown; posts?: unknown }
@@ -218,13 +215,15 @@ async function callOpenAIForGroupsLimited(
       });
     }
 
-    return {
+    const result: GroupSummary = {
       key,
       label,
       count: items.length,
       overview: overview || `AI summary unavailable for ${label}.`,
       posts: patched.slice(0, sample.length),
     };
+    setCache(cacheKey, result);
+    return result;
   }
 
   const homeworkEntries = Array.from(groups.homeworkGroups.entries())
@@ -235,13 +234,11 @@ async function callOpenAIForGroupsLimited(
     .sort((a, b) => b[1].length - a[1].length)
     .slice(0, maxGroups);
 
-  const homeworks = await Promise.all(
-    homeworkEntries.map(([key, items]) =>
-      summarizeGroup(`Homework ${key.replace(/^hw:/, "")}`, key, items)
-    )
+  const homeworks = await mapWithConcurrency(homeworkEntries, concurrency, ([key, items]) =>
+    summarizeGroup(`Homework ${key.replace(/^hw:/, "")}`, key, items)
   );
-  const models = await Promise.all(
-    modelEntries.map(([key, items]) => summarizeGroup(`Model ${key.replace(/^model:/, "")}`, key, items))
+  const models = await mapWithConcurrency(modelEntries, concurrency, ([key, items]) =>
+    summarizeGroup(`Model ${key.replace(/^model:/, "")}`, key, items)
   );
 
   return {
@@ -321,11 +318,11 @@ function buildHeuristicPerspective(threads: Post[], note: string): AIPerspective
 function buildHeuristicGroupedPerspective(threads: Post[], note: string): GroupedAIPerspective {
   const { homeworkGroups, modelGroups } = groupThreads(threads);
 
-  const toSummary = (labelPrefix: string, key: string, items: Thread[]): GroupSummary => ({
+  const toSummary = (labelPrefix: string, key: string, items: Post[]): GroupSummary => ({
     key,
     label: `${labelPrefix} ${key.replace(/^(hw:|model:)/, "")}`,
     count: items.length,
-    overview: `Heuristic overview: ${items.length} threads. ${note}`,
+    overview: `Heuristic overview: ${items.length} posts. ${note}`,
     posts: items.slice(0, 40).map((thread) => ({
       id: thread.id,
       title: thread.title,
@@ -472,4 +469,111 @@ function safeParseJsonObject(input: string): unknown | null {
   } catch {
     return null;
   }
+}
+
+type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+
+async function openaiChatCompletion(params: {
+  apiKey: string;
+  model: string;
+  messages: ChatMessage[];
+  temperature: number;
+}): Promise<{ content: string; modelUsed: string }> {
+  const { apiKey, model, messages, temperature } = params;
+  const url = "https://api.openai.com/v1/chat/completions";
+
+  const maxAttempts = Math.max(1, Number(process.env.AI_OPENAI_MAX_RETRIES ?? 5));
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature,
+      }),
+    });
+
+    if (response.ok) {
+      const json = await response.json();
+      const content = json.choices?.[0]?.message?.content as string | undefined;
+      if (!content) throw new Error("OpenAI response missing content");
+      return { content, modelUsed: (json.model ?? model) as string };
+    }
+
+    // Rate limit / transient: retry with backoff.
+    if (response.status === 429 || (response.status >= 500 && response.status <= 599)) {
+      const retryAfter = response.headers.get("retry-after");
+      const retryAfterMs = retryAfter ? Number(retryAfter) * 1000 : 0;
+      const backoffMs = Math.min(30_000, 600 * 2 ** (attempt - 1) + jitter(250));
+      await sleep(Math.max(retryAfterMs, backoffMs));
+      continue;
+    }
+
+    const body = await safeReadText(response);
+    throw new Error(`OpenAI responded with ${response.status}${body ? `: ${body.slice(0, 140)}` : ""}`);
+  }
+
+  throw new Error("OpenAI retries exhausted (429/5xx).");
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let index = 0;
+
+  async function worker() {
+    while (true) {
+      const current = index;
+      index += 1;
+      if (current >= items.length) return;
+      results[current] = await fn(items[current]);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function jitter(maxMs: number) {
+  return Math.floor(Math.random() * maxMs);
+}
+
+async function safeReadText(response: Response): Promise<string> {
+  try {
+    return await response.text();
+  } catch {
+    return "";
+  }
+}
+
+function hashKey(input: unknown): string {
+  return crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex");
+}
+
+function getCache<T>(key: string): T | null {
+  const cache = getGlobalCache();
+  return (cache.get(key) as T | undefined) ?? null;
+}
+
+function setCache(key: string, value: unknown) {
+  const cache = getGlobalCache();
+  cache.set(key, value);
+}
+
+function getGlobalCache(): Map<string, unknown> {
+  const g = globalThis as unknown as { __ai_cache?: Map<string, unknown> };
+  if (!g.__ai_cache) g.__ai_cache = new Map<string, unknown>();
+  return g.__ai_cache;
 }
